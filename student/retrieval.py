@@ -1,38 +1,102 @@
-"""✏️ ส่วนที่ 3: Retrieval — ค้นหา chunk ที่เกี่ยวข้องกับคำถาม
+"""✏️ ส่วนที่ 3: Retrieval — hybrid search (vector + BM25 แบบ n-gram)"""
+import math
+import re
+from collections import Counter
 
-ค่าตั้งต้นตอนยังไม่ทำ: ไม่คืน chunk ใดเลย LLM จึงไม่เห็นเอกสาร
-"""
 from core.types import Chunk
-from core.utils import cosine, cosine_many  # noqa: F401 — ตัวช่วยคำนวณความคล้ายของ vector
-from student import settings  # noqa: F401 — TOP_K, QUERY_WITH_OPTIONS, HYBRID_WEIGHT, MIN_SCORE
+from core.utils import cosine, cosine_many  # noqa: F401
+from student import settings
+
+_K1, _B = 1.5, 0.75
+_TOKEN = re.compile(r"[a-z0-9_]+|[\u0E00-\u0E7F]+")
+
+
+def _tokens(text: str) -> list[str]:
+    toks: list[str] = []
+    for m in _TOKEN.finditer(text.lower()):
+        s = m.group()
+        if "\u0e00" <= s[0] <= "\u0e7f":
+            # ภาษาไทยไม่มีช่องว่างคั่นคำ ใช้ bigram + trigram
+            if len(s) < 2:
+                toks.append(s)
+            for n in (2, 3):
+                toks.extend(s[i:i + n] for i in range(len(s) - n + 1))
+        else:
+            toks.append(s)
+    return toks
+
+
+_cache: dict = {}
+
+
+def _index(chunks: list[Chunk]):
+    key = tuple(hash(c.text) for c in chunks)
+    if _cache.get("key") == key:
+        return _cache["idx"]
+    docs = [Counter(_tokens(c.text)) for c in chunks]
+    lens = [sum(d.values()) for d in docs]
+    avg = (sum(lens) / len(lens)) or 1.0
+    df: Counter = Counter()
+    for d in docs:
+        df.update(d.keys())
+    idx = (docs, lens, avg, df)
+    _cache["key"], _cache["idx"] = key, idx
+    return idx
+
+
+def _bm25(chunks: list[Chunk], query: str) -> list[float]:
+    docs, lens, avg, df = _index(chunks)
+    n_docs = len(docs)
+    scores = [0.0] * n_docs
+    for tok in set(_tokens(query)):
+        n = df.get(tok, 0)
+        if not n:
+            continue
+        idf = math.log(1 + (n_docs - n + 0.5) / (n + 0.5))
+        for i, d in enumerate(docs):
+            f = d.get(tok, 0)
+            if f:
+                scores[i] += idf * f * (_K1 + 1) / (f + _K1 * (1 - _B + _B * lens[i] / avg))
+    return scores
+
+
+def _norm(xs: list[float]) -> list[float]:
+    if not xs:
+        return xs
+    lo, hi = min(xs), max(xs)
+    if hi - lo < 1e-12:
+        return [0.0] * len(xs)
+    return [(x - lo) / (hi - lo) for x in xs]
 
 
 def make_query(question: str, options: list[str]) -> str:
-    """สร้างข้อความที่จะใช้ค้นหา
-
-    รับ:  question  คำถาม (หรือ requirement ของโจทย์เขียนโค้ด ซึ่งกรณีนี้ options จะเป็น list ว่าง)
-          options   ข้อความของตัวเลือก ก–จ (ไม่มีตัวอักษร key นำหน้า)
-    คืน:  สตริงคำค้น (ห้ามว่าง)
-
-    แนวทาง: ลองรวมคำถามกับตัวเลือกเข้าด้วยกัน เพราะคำตอบมักอยู่ในย่อหน้าที่มีคำของตัวเลือก
-    """
-    # TODO HERE: Retrieval
-    pass
+    q = (question or "").strip()
+    if options and getattr(settings, "QUERY_WITH_OPTIONS", True):
+        q = q + "\n" + "\n".join(o.strip() for o in options if o and o.strip())
+    return q.strip() or "."
 
 
 def search(chunks: list[Chunk], query_text: str, query_vector: list[float] | None, k: int) -> list[tuple[Chunk, float]]:
-    """เลือก chunk ที่เกี่ยวข้องที่สุด k ชิ้น
+    if not chunks:
+        return []
+    top_k = int(getattr(settings, "TOP_K", k) or k)
+    w = float(getattr(settings, "HYBRID_WEIGHT", 0.5))
 
-    รับ:  chunks        chunk ทั้งหมดของเอกสารชุดนี้ (chunk.text, chunk.vector, chunk.doc_id)
-          query_text    คำค้น (จาก make_query)
-          query_vector  vector ของคำค้น (จาก embedding.embed_query) หรือ None ถ้ายังไม่ได้ทำ embedding
-          k             จำนวนที่ระบบแนะนำ (5) จะใช้ settings.TOP_K ของตัวเองแทนก็ได้
-    คืน:  list ของ (chunk, score) เรียงจากเกี่ยวข้องมากไปน้อย
+    kw = _bm25(chunks, query_text)
 
-    แนวทาง:
-      - วิธีพื้นฐาน: scores = cosine_many(query_vector, [c.vector for c in chunks]) แล้วเลือก k ตัวที่คะแนนสูงสุด
-      - วิธีที่ดีขึ้น: hybrid search คือรวมคะแนน vector กับคะแนนการจับคำ (keyword / BM25) ช่วยมากกับชื่อเฉพาะและตัวเลข
-      - ระวังกรณีที่ chunk.vector หรือ query_vector เป็น None
-    """
-    # TODO HERE: Retrieval
-    pass
+    vec = None
+    if query_vector is not None and all(c.vector is not None for c in chunks):
+        try:
+            vec = [float(x) for x in cosine_many(query_vector, [c.vector for c in chunks])]
+        except Exception:
+            vec = None
+
+    if vec is None:
+        final = _norm(kw)
+    elif max(kw) <= 0:
+        final = _norm(vec)
+    else:
+        final = [(1 - w) * a + w * b for a, b in zip(_norm(vec), _norm(kw))]
+
+    order = sorted(range(len(chunks)), key=lambda i: final[i], reverse=True)[:top_k]
+    return [(chunks[i], float(final[i])) for i in order]
